@@ -5,6 +5,8 @@ from pytest import ExitCode
 from pytest_skip.plugin import Matcher
 from .conftest import SELECT_OPT, DESELECT_OPT, SKIP_OPT, XFAIL_OPT
 
+XFAIL_NORUN_OPT = "--xfail-norun-from-file"
+
 # FIXME: this needs a refactoring where we make each test a structure
 # what contains the failing/passing combinations as a field
 TEST_CONTENT_PASSING_COMBINATIONS = ("test_a[1-1]", "test_a[1-4]")
@@ -78,6 +80,24 @@ TEST_CONTENT_WITH_REGEXP_AS_PARAM = """
     )
     def test_a(a):
         assert True
+"""
+
+TEST_CONTENT_NORUN = """
+    import pathlib
+    import pytest
+
+    BODY_RAN = pathlib.Path(__file__).with_name("body_ran")
+
+    def test_raises():
+        BODY_RAN.touch()
+        raise RuntimeError("body must not run")
+
+    def test_passes():
+        BODY_RAN.touch()
+
+    @pytest.mark.xfail(reason="own xfail decorator")
+    def test_decorated():
+        BODY_RAN.touch()
 """
 
 
@@ -328,6 +348,60 @@ def test_missing_selection_file_fails(testdir, option_name):
             },
             [],
         ),
+        # xfail-norun: the passing test_a[1-1] and test_a[1-4] are XFAIL, not XPASS, because
+        # their bodies do not run.
+        (
+            XFAIL_NORUN_OPT,
+            ["{testfile}::test_a"],
+            0,
+            {
+                "xfailed": 4
+            },
+            [],
+        ),
+        (
+            XFAIL_NORUN_OPT,
+            [
+                "{testfile}::test_a[1-2]",
+                "test_a[1-3]",
+                "test_a[3-1]",
+                "test_that_does_not_exist",
+            ],
+            0,
+            {
+                "passed": 2,
+                "xfailed": 2
+            },
+            [
+                r".*Not all tests to xfail-norun exist.*",
+                r"\s+Missing test names to xfail-norun:",
+                r"\s+- test_a\[3-1\]",
+                r"\s+- test_that_does_not_exist",
+            ],
+        ),
+        (
+            XFAIL_NORUN_OPT,
+            ["test_a[r\"1-.*\"]@regexp"],
+            0,
+            {
+                "xfailed": 4
+            },
+            [],
+        ),
+        (
+            XFAIL_NORUN_OPT,
+            [
+                "test_a[r\"1-1\"]@regexp",
+                "{testfile}::test_a[r\"1-2\"]@regexp",
+                "test_a[r\".*-3\"]@regexp",
+            ],
+            0,
+            {
+                "passed": 1,
+                "xfailed": 3
+            },
+            [],
+        ),
     ),
 )
 def test_tests_are_selected(  # pylint: disable=R0913, disable=R0917
@@ -356,35 +430,31 @@ def test_tests_are_selected(  # pylint: disable=R0913, disable=R0917
 
 @pytest.mark.parametrize("use_xdist", (False, True))
 @pytest.mark.parametrize("has_missing_tests", (False, True))
-@pytest.mark.parametrize("deselect", (False, True))
-def test_fail_on_missing(is_xdist_installed, testdir, deselect, has_missing_tests, use_xdist):
+@pytest.mark.parametrize("option", ("select", "deselect", "xfail", "xfail-norun"))
+def test_fail_on_missing(is_xdist_installed, testdir, option, has_missing_tests, use_xdist):
     if use_xdist and not is_xdist_installed:
         pytest.skip("xdist is not installed")
 
     testdir.makefile(".py", TEST_CONTENT)
 
-    existing_tests = TEST_CONTENT_FAILING_COMBINATIONS if deselect else TEST_CONTENT_PASSING_COMBINATIONS
+    # All options but select list the failing tests, so the run is green when none is missing.
+    existing_tests = (TEST_CONTENT_PASSING_COMBINATIONS
+                      if option == "select" else TEST_CONTENT_FAILING_COMBINATIONS)
     file_tests = ("test_a[1-1]", "test_a[2-1]") if has_missing_tests else existing_tests
     selectfile = testdir.makefile(".txt", *file_tests)
     result = testdir.runpytest(
         "-v",
         "--select-fail-on-missing",
         "-n 1" if use_xdist else "",
-        f"--{'de' if deselect else ''}select-from-file",  # pylint: disable=W1405
+        f"--{option}-from-file",
         selectfile,
     )
 
     assert result.ret == (4 if has_missing_tests else 0)
-    if deselect:
-        first_line = r"pytest-skip: Not all tests to deselect exist."
-        second_line = r"Missing test names to deselect:"
-    else:
-        first_line = r"pytest-skip: Not all tests to select exist."
-        second_line = r"Missing test names to select:"
     if has_missing_tests:
         result.stderr.re_match_lines([
-            first_line,
-            second_line,
+            fr"pytest-skip: Not all tests to {option} exist.",
+            fr"Missing test names to {option}:",
             # "  - test_a[2-1]",
         ])
 
@@ -526,6 +596,21 @@ def test_xfail_strict_fails_run_on_unexpected_pass(testdir):
     result.stdout.re_match_lines([r".*test_a\[1-1-1\] FAILED.*"])
 
 
+def test_xfail_follows_ini_xfail_strict(testdir):
+    # Without --xfail-strict, the project's xfail_strict ini setting applies to the plugin's mark.
+    testdir.makeini("""
+        [pytest]
+        xfail_strict = true
+    """)
+    testdir.makefile(".py", TEST_CONTENT_PASS)
+    result = testdir.runpytest("-v", "-Walways", "--xfail-test", "test_a[1-1-1]")
+
+    assert result.ret == ExitCode.TESTS_FAILED
+    result.assert_outcomes(passed=26, failed=1)
+    result.stdout.re_match_lines(
+        [r".*test_a\[1-1-1\] FAILED.*", r".*\[XPASS\(strict\)\] Xfailed by pytest-skip.*"])
+
+
 def test_xfail_strict_does_not_affect_expected_failures(testdir):
     # With --xfail-strict, a test that is marked xfail and genuinely fails is unaffected:
     # it is still reported as XFAILED (not FAILED), regardless of strictness. TEST_CONTENT's
@@ -556,10 +641,103 @@ def test_xfail_collision_with_higher_precedence_option_warns(testdir, colliding_
                                colliding_file)
 
     assert result.ret == 0
+    reason = "skipped" if colliding_option is SKIP_OPT else "deselected"
     result.stdout.re_match_lines([
         r".*pytest-skip: '.*test_a\[1-1-1\]' matched --xfail-from-file/--xfail-test, but the "
-        r"test is (deselected|skipped); the xfail marker was NOT applied.*",
+        fr"test is {reason}; the xfail marker was NOT applied.*",
     ])
+
+
+@pytest.mark.parametrize("use_file", (True, False))
+def test_xfail_norun_does_not_run_body(testdir, use_file):
+    # No listed body may run, including test_decorated, whose own xfail decorator would
+    # otherwise be the first xfail mark pytest evaluates and would run it (XPASS).
+    testfile = testdir.makefile(".py", TEST_CONTENT_NORUN)
+    names = [
+        f"{testfile.relto(testdir.tmpdir)}::{name}"
+        for name in ("test_raises", "test_passes", "test_decorated")
+    ]
+    if use_file:
+        args = [XFAIL_NORUN_OPT, testdir.makefile(".txt", *names)]
+        header = r"select: xfailing without running tests from '.*'$"
+    else:
+        args = ["--xfail-norun-test", ";".join(names)]
+        header = r"select: xfailing without running tests '.*'$"
+    result = testdir.runpytest("-v", "-rx", "-Walways", *args)
+
+    assert result.ret == ExitCode.OK
+    result.assert_outcomes(xfailed=3)
+    assert not testfile.dirpath().join("body_ran").exists()
+    result.stdout.re_match_lines_random([header] + [
+        fr".*XFAIL .*::{name} - \[NOTRUN\] Xfailed by pytest-skip$"
+        for name in ("test_raises", "test_passes", "test_decorated")
+    ])
+
+
+def test_xfail_norun_wins_over_xfail(testdir):
+    # A name in both lists is not run (XFAIL, not XPASS) and the overlap is reported.
+    testfile = testdir.makefile(".py", TEST_CONTENT_PASS)
+    both_test = f"{testfile.relto(testdir.tmpdir)}::test_a[1-1-1]"
+    xfail_file = testdir.makefile(".xfail.txt", both_test)
+    xfail_norun_file = testdir.makefile(".norun.txt", both_test)
+    result = testdir.runpytest("-v", "-Walways", XFAIL_OPT, xfail_file, XFAIL_NORUN_OPT,
+                               xfail_norun_file, "--xfail-strict")
+
+    assert result.ret == ExitCode.OK
+    result.assert_outcomes(passed=26, xfailed=1)
+    result.stdout.re_match_lines([
+        r".*pytest-skip: '.*test_a\[1-1-1\]' matched both --xfail-from-file/--xfail-test and "
+        r"--xfail-norun-from-file/--xfail-norun-test; xfail-norun takes precedence.*",
+    ])
+
+
+@pytest.mark.parametrize("colliding_option", (SKIP_OPT, DESELECT_OPT))
+def test_xfail_norun_collision_with_higher_precedence_option_warns(testdir, colliding_option):
+    testfile = testdir.makefile(".py", TEST_CONTENT_PASS)
+    colliding_test = f"{testfile.relto(testdir.tmpdir)}::test_a[1-1-1]"
+    xfail_norun_file = testdir.makefile(".norun.txt", colliding_test)
+    colliding_file = testdir.makefile(".colliding.txt", colliding_test)
+    result = testdir.runpytest("-v", "-Walways", XFAIL_NORUN_OPT, xfail_norun_file,
+                               colliding_option, colliding_file)
+
+    assert result.ret == ExitCode.OK
+    if colliding_option is SKIP_OPT:
+        reason = "skipped"
+        result.assert_outcomes(passed=26, skipped=1)
+    else:
+        reason = "deselected"
+        result.assert_outcomes(passed=26, deselected=1)
+    result.stdout.re_match_lines([
+        r".*pytest-skip: '.*test_a\[1-1-1\]' matched --xfail-norun-from-file/"
+        fr"--xfail-norun-test, but the test is {reason}; the xfail\(run=False\) marker "
+        r"was NOT applied.*",
+    ])
+
+
+@pytest.mark.parametrize("xfail_option", (XFAIL_OPT, XFAIL_NORUN_OPT))
+def test_xfail_on_unselected_test_does_not_warn(testdir, xfail_option):
+    # A test left out by --select-* is not a collision: like --skip-test, no warning.
+    testfile = testdir.makefile(".py", TEST_CONTENT_PASS)
+    prefix = f"{testfile.relto(testdir.tmpdir)}::"
+    xfail_file = testdir.makefile(".txt", f"{prefix}test_a[1-1-2]")
+    result = testdir.runpytest("-v", "-Walways", "--select-test", f"{prefix}test_a[1-1-1]",
+                               xfail_option, xfail_file)
+
+    assert result.ret == ExitCode.OK
+    result.assert_outcomes(passed=1)
+    result.stdout.no_re_match_line(r".*pytest-skip: .*")
+
+
+def test_xfail_norun_items_are_sharded(testdir):
+    # xfail-norun items stay selected, so sharding splits them like any other test:
+    # round-robin shard 0 of 2 over 27 tests keeps indices 0, 2, ..., 26.
+    testfile = testdir.makefile(".py", TEST_CONTENT_PASS)
+    xfail_norun_file = testdir.makefile(".txt", f"{testfile.relto(testdir.tmpdir)}::test_a")
+    result = testdir.runpytest("-v", "-Walways", XFAIL_NORUN_OPT, xfail_norun_file,
+                               "--num-shards=2", "--shard-id=0")
+
+    assert result.ret == ExitCode.OK
+    result.assert_outcomes(xfailed=14, deselected=13)
 
 
 @pytest.mark.parametrize("skipfile_str,is_regexp,test_name,params,", [
@@ -676,8 +854,7 @@ def test_select_deselect_skip_xfail(  # pylint: disable=R0913, disable=R0917
     always passes, a test that does get the xfail marker applied is reported as XPASS
     rather than PASSED.
 
-    Reordering the skip/xfail checks, or disabling xfail marking entirely, must make this
-    test fail.
+    Disabling xfail marking entirely must make this test fail.
     """
     node_ids = [f"test_a[{a}-{b}-{c}]" for a, b, c in itertools.product((1, 2, 3), repeat=3)]
     testfile = testdir.makefile(".py", TEST_CONTENT_PASS)
